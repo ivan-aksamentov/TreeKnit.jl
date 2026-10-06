@@ -18,6 +18,16 @@ kept(a, conf) = Set(i for i in a.conf if conf[i])
 	end
 end
 
+@testset "Split layout" begin
+	L = SplitGraph.SplitLayout(g)
+	@test sort(L.bit) == 0:(n-1)
+	for (a, node) in enumerate(g.internals)
+		bits = [64*(w-1) + b for w in axes(L.clade, 1) for b in 0:63 if (L.clade[w, a] >> b) & 1 == 1]
+		@test sort(bits) == sort(L.bit[node.conf])
+		@test all(iszero, L.clade[setdiff(axes(L.clade, 1), L.wlo[a]:L.whi[a]), a])
+	end
+end
+
 @testset "Split comparisons match set operations" begin
 	rng = MersenneTwister(1)
 	nodes = g.internals

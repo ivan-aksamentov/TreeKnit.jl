@@ -154,8 +154,13 @@ end
 Integer layout of the internal nodes of `g` for `EnergyState`, numbered as in `g.internals`.
 - `parent[a]`: parent of node `a`, `0` for a root
 - `splitchild[a]`, `leafchild[a]`: internal children and leaf children of `a`
-- `clade[:, a]`: the leaves below `a` as a bit set in 64-bit words
+- `clade[:, a]`: the leaves below `a` as a bit set in 64-bit words, of which only the words
+  `wlo[a]:whi[a]` can be non-zero
 - `leafanc[k, i]`: parent of leaf `i` in tree `k`
+- `bit[i]`: position of leaf `i` in the bit sets
+
+Leaves are placed in the bit sets in depth-first order of the first tree, so that every
+clade of that tree, and most clades of similar trees, cover a short range of words.
 """
 struct SplitLayout
 	K::Int
@@ -164,7 +169,10 @@ struct SplitLayout
 	splitchild::Vector{Vector{Int}}
 	leafchild::Vector{Vector{Int}}
 	clade::Matrix{UInt64}
+	wlo::Vector{Int}
+	whi::Vector{Int}
 	leafanc::Matrix{Int}
+	bit::Vector{Int}
 end
 
 function SplitLayout(g::Graph)
@@ -184,13 +192,26 @@ function SplitLayout(g::Graph)
 				push!(leafchild[a], c.index)
 			end
 		end
-		for i in node.conf
-			clade[(i - 1) >> 6 + 1, a] |= one(UInt64) << ((i - 1) & 63)
-		end
 	end
+	bit = zeros(Int, nleaves)
+	next = 0
+	stack = [a for a in 1:nnodes if parent[a] == 0 && g.internals[a].color == 1]
+	while !isempty(stack)
+		a = pop!(stack)
+		for i in leafchild[a]
+			bit[i] = next
+			next += 1
+		end
+		append!(stack, splitchild[a])
+	end
+	for (a, node) in enumerate(g.internals), i in node.conf
+		clade[bit[i] >> 6 + 1, a] |= one(UInt64) << (bit[i] & 63)
+	end
+	wlo = [something(findfirst(!iszero, view(clade, :, a)), 1) for a in 1:nnodes]
+	whi = [something(findlast(!iszero, view(clade, :, a)), 0) for a in 1:nnodes]
 	leafanc = [index[g.leaves[i].anc[k]] for k in 1:g.K, i in 1:nleaves]
 	trivial = nleaves + nnodes == 1
-	return SplitLayout(g.K, trivial, parent, splitchild, leafchild, clade, leafanc)
+	return SplitLayout(g.K, trivial, parent, splitchild, leafchild, clade, wlo, whi, leafanc, bit)
 end
 
 """
@@ -227,9 +248,9 @@ function EnergyState(L::SplitLayout, conf, resolve; terms=true)
 	n = length(conf)
 	words = zeros(UInt64, size(L.clade, 1))
 	for i in 1:n
-		conf[i] && (words[(i - 1) >> 6 + 1] |= one(UInt64) << ((i - 1) & 63))
+		conf[i] && (words[L.bit[i] >> 6 + 1] |= one(UInt64) << (L.bit[i] & 63))
 	end
-	count = [sum(w -> count_ones(L.clade[w, a] & words[w]), eachindex(words); init = 0) for a in axes(L.clade, 2)]
+	count = [sum(w -> count_ones(L.clade[w, a] & words[w]), L.wlo[a]:L.whi[a]; init = 0) for a in axes(L.clade, 2)]
 	st = EnergyState(
 		L, resolve, copy(conf), words, count, zeros(Int, n), 0, Int[], zeros(Int, n), 0, Tuple{Int,Int}[], 0,
 		zeros(Int, L.K),
@@ -283,7 +304,7 @@ end
 function toggle!(st::EnergyState, j)
 	L = st.L
 	st.conf[j] = !st.conf[j]
-	st.words[(j - 1) >> 6 + 1] ⊻= one(UInt64) << ((j - 1) & 63)
+	st.words[L.bit[j] >> 6 + 1] ⊻= one(UInt64) << (L.bit[j] & 63)
 	d = st.conf[j] ? 1 : -1
 	@inbounds for k in 1:L.K
 		a = L.leafanc[k, j]
@@ -359,10 +380,11 @@ end
 
 # Word-level version of `are_equal` and `are_equal_with_resolution` on nodes `a1`, `a2`.
 # Equal splits have equal numbers of kept leaves, and a split has no more kept leaves than a
-# split that contains it, so the counts rule out most comparisons.
+# split that contains it, so the counts rule out most comparisons. With equal numbers of kept
+# leaves, inclusion is equality.
 function compatible(st::EnergyState, a1, a2)
 	c1, c2 = st.count[a1], st.count[a2]
-	c1 == c2 && eq_on(st, a1, a2) && return true
+	c1 == c2 && subset_on(st, a1, a2) && return true
 	st.resolve || return false
 	return (c1 <= c2 && subset_on(st, a1, a2) && refinable(st, a1, a2)) ||
 		(c2 <= c1 && subset_on(st, a2, a1) && refinable(st, a2, a1))
@@ -376,26 +398,20 @@ function refinable(st::EnergyState, s, a)
 	return true
 end
 
-function eq_on(st::EnergyState, a, b)
-	C, m = st.L.clade, st.words
-	@inbounds for w in eachindex(m)
-		iszero((C[w, a] ⊻ C[w, b]) & m[w]) || return false
-	end
-	return true
-end
-
+# Are the kept leaves of `a` below `b`?
 function subset_on(st::EnergyState, a, b)
-	C, m = st.L.clade, st.words
-	@inbounds for w in eachindex(m)
-		iszero(C[w, a] & ~C[w, b] & m[w]) || return false
+	L, m = st.L, st.words
+	@inbounds for w in L.wlo[a]:L.whi[a]
+		iszero(L.clade[w, a] & ~L.clade[w, b] & m[w]) || return false
 	end
 	return true
 end
 
+# Do `a` and `b` have no kept leaf in common?
 function disjoint_on(st::EnergyState, a, b)
-	C, m = st.L.clade, st.words
-	@inbounds for w in eachindex(m)
-		iszero(C[w, a] & C[w, b] & m[w]) || return false
+	L, m = st.L, st.words
+	@inbounds for w in max(L.wlo[a], L.wlo[b]):min(L.whi[a], L.whi[b])
+		iszero(L.clade[w, a] & L.clade[w, b] & m[w]) || return false
 	end
 	return true
 end
