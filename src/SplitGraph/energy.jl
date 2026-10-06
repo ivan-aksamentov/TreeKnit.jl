@@ -163,12 +163,13 @@ function doMCMC(
 )
 	_conf = copy(conf)
 	E = compute_energy(_conf, g)
-	F = E + γ*(length(conf) - sum(conf))
+	nremoved = length(_conf) - sum(_conf)
+	F = E + γ*nremoved
 	Fmin = F
 
 	oconf = [copy(_conf)]
 	for m in 1:M
-		E, F = mcmcstep!(_conf, g, F, T, γ)
+		E, F, nremoved = mcmcstep!(_conf, g, E, F, nremoved, T, γ)
 		# If new minimum is found
 		if F < Fmin
 			Fmin = F
@@ -184,22 +185,24 @@ function doMCMC(
 end
 
 """
-	mcmcstep!(conf, g, F, T, γ)
+	mcmcstep!(conf, g, E, F, nremoved, T, γ)
 
-Perform an mcmc step by removing a node from `conf` at random.
+Perform an mcmc step by flipping a leaf of `conf` at random. `E`, `F` and `nremoved` are the
+energy, the free energy and the number of removed leaves of `conf` before the step.
 
-Return (E, F) of mcmc step.
+Return `(E, F, nremoved)` after the step.
 """
-function mcmcstep!(conf, g, F, T, γ)
+function mcmcstep!(conf, g, E, F, nremoved, T, γ)
 	i = rand(1:length(conf))
 	conf[i] = !conf[i]
+	nremoved_new = conf[i] ? nremoved - 1 : nremoved + 1
 	Enew = compute_energy(conf, g)
-	Fnew = Enew + γ*(length(conf) - sum(conf))
+	Fnew = Enew + γ*nremoved_new
 	if Fnew < F || exp(-(Fnew-F)/T) > rand()
-		return Enew, Fnew
+		return Enew, Fnew, nremoved_new
 	else
 		conf[i] = !conf[i]
-		return (round(Int64, F-γ*(length(conf) - sum(conf))), F)
+		return E, F, nremoved
 	end
 end
 
