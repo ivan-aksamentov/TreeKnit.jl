@@ -149,6 +149,255 @@ end
 
 
 """
+	SplitLayout(g::Graph)
+
+Integer layout of the internal nodes of `g` for `EnergyState`, numbered as in `g.internals`.
+- `parent[a]`: parent of node `a`, `0` for a root
+- `splitchild[a]`, `leafchild[a]`: internal children and leaf children of `a`
+- `clade[:, a]`: the leaves below `a` as a bit set in 64-bit words
+- `leafanc[k, i]`: parent of leaf `i` in tree `k`
+"""
+struct SplitLayout
+	K::Int
+	trivial::Bool
+	parent::Vector{Int}
+	splitchild::Vector{Vector{Int}}
+	leafchild::Vector{Vector{Int}}
+	clade::Matrix{UInt64}
+	leafanc::Matrix{Int}
+end
+
+function SplitLayout(g::Graph)
+	index = IdDict{SplitNode,Int}(a => n for (n, a) in enumerate(g.internals))
+	nnodes = length(g.internals)
+	nleaves = length(g.leaves)
+	parent = zeros(Int, nnodes)
+	splitchild = [Int[] for _ in 1:nnodes]
+	leafchild = [Int[] for _ in 1:nnodes]
+	clade = zeros(UInt64, cld(nleaves, 64), nnodes)
+	for (a, node) in enumerate(g.internals)
+		node.isroot || (parent[a] = index[node.anc])
+		for c in node.child
+			if c isa SplitNode
+				push!(splitchild[a], index[c])
+			else
+				push!(leafchild[a], c.index)
+			end
+		end
+		for i in node.conf
+			clade[(i - 1) >> 6 + 1, a] |= one(UInt64) << ((i - 1) & 63)
+		end
+	end
+	leafanc = [index[g.leaves[i].anc[k]] for k in 1:g.K, i in 1:nleaves]
+	trivial = nleaves + nnodes == 1
+	return SplitLayout(g.K, trivial, parent, splitchild, leafchild, clade, leafanc)
+end
+
+"""
+	EnergyState(L::SplitLayout, conf, resolve)
+
+Energy of the leaf configuration `conf`, kept equal to `compute_energy` under single-leaf
+flips (`flip!`, `undo!`).
+
+The energy is a sum of one term per kept leaf, which compares the first non-trivial ancestors
+of the leaf in each tree. Flipping leaf `j` changes the term of `j` and of the kept leaves
+whose first non-trivial ancestor in some tree is an ancestor of `j`. Each of these is the
+only kept leaf below a child of an ancestor of `j`, before or after the flip. The number of
+kept leaves below every node is maintained along the root paths of `j`, so these leaves and
+the first non-trivial ancestors are found without scanning splits.
+"""
+mutable struct EnergyState
+	L::SplitLayout
+	resolve::Bool
+	conf::Vector{Bool}
+	words::Vector{UInt64}
+	count::Vector{Int}
+	term::Vector{Int}
+	E::Int
+	cand::Vector{Int}
+	stamp::Vector{Int}
+	step::Int
+	undo::Vector{Tuple{Int,Int}}
+	flipped::Int
+	anc::Vector{Int}
+end
+
+function EnergyState(L::SplitLayout, conf, resolve)
+	n = length(conf)
+	words = zeros(UInt64, size(L.clade, 1))
+	for i in 1:n
+		conf[i] && (words[(i - 1) >> 6 + 1] |= one(UInt64) << ((i - 1) & 63))
+	end
+	count = [sum(w -> count_ones(L.clade[w, a] & words[w]), eachindex(words); init = 0) for a in axes(L.clade, 2)]
+	st = EnergyState(
+		L, resolve, copy(conf), words, count, zeros(Int, n), 0, Int[], zeros(Int, n), 0, Tuple{Int,Int}[], 0,
+		zeros(Int, L.K),
+	)
+	for i in 1:n
+		st.term[i] = leaf_term(st, i)
+	end
+	st.E = sum(st.term; init = 0)
+	return st
+end
+
+"""
+	flip!(st::EnergyState, j)
+
+Flip leaf `j` and return the new energy. `undo!` reverts the last flip.
+"""
+function flip!(st::EnergyState, j)
+	empty!(st.cand)
+	st.step += 1
+	add_candidate!(st, j)
+	affected_leaves!(st, j)
+	toggle!(st, j)
+	affected_leaves!(st, j)
+	empty!(st.undo)
+	@inbounds for i in st.cand
+		t = leaf_term(st, i)
+		push!(st.undo, (i, st.term[i]))
+		st.E += t - st.term[i]
+		st.term[i] = t
+	end
+	st.flipped = j
+	return st.E
+end
+
+"""
+	undo!(st::EnergyState)
+
+Revert the last `flip!`.
+"""
+function undo!(st::EnergyState)
+	@inbounds for (i, t) in st.undo
+		st.E += t - st.term[i]
+		st.term[i] = t
+	end
+	toggle!(st, st.flipped)
+	return nothing
+end
+
+function toggle!(st::EnergyState, j)
+	L = st.L
+	st.conf[j] = !st.conf[j]
+	st.words[(j - 1) >> 6 + 1] ⊻= one(UInt64) << ((j - 1) & 63)
+	d = st.conf[j] ? 1 : -1
+	@inbounds for k in 1:L.K
+		a = L.leafanc[k, j]
+		while a != 0
+			st.count[a] += d
+			a = L.parent[a]
+		end
+	end
+	return nothing
+end
+
+# Add to `st.cand` the kept leaves that are the only kept leaf below a child of an ancestor of `j`.
+function affected_leaves!(st::EnergyState, j)
+	L = st.L
+	@inbounds for k in 1:L.K
+		a = L.leafanc[k, j]
+		while a != 0
+			for l in L.leafchild[a]
+				st.conf[l] && add_candidate!(st, l)
+			end
+			for c in L.splitchild[a]
+				st.count[c] == 1 && add_candidate!(st, single_kept_leaf(st, c))
+			end
+			a = L.parent[a]
+		end
+	end
+	return nothing
+end
+
+# Add leaf `l` to `st.cand` once per flip.
+@inline function add_candidate!(st::EnergyState, l)
+	@inbounds if st.stamp[l] != st.step
+		st.stamp[l] = st.step
+		push!(st.cand, l)
+	end
+	return nothing
+end
+
+# The only kept leaf below node `a`, which has exactly one.
+function single_kept_leaf(st::EnergyState, a)
+	L = st.L
+	@inbounds while true
+		for l in L.leafchild[a]
+			st.conf[l] && return l
+		end
+		for c in L.splitchild[a]
+			if st.count[c] == 1
+				a = c
+				break
+			end
+		end
+	end
+end
+
+# Contribution of leaf `i` to the energy: the number of tree pairs whose first non-trivial
+# ancestors of `i` are not equal (or not compatible by resolution).
+function leaf_term(st::EnergyState, i)
+	L = st.L
+	(st.conf[i] && !L.trivial) || return 0
+	@inbounds for k in 1:L.K
+		a = L.leafanc[k, i]
+		while st.count[a] < 2 && L.parent[a] != 0
+			a = L.parent[a]
+		end
+		st.anc[k] = a
+	end
+	E = 0
+	@inbounds for k1 in 1:L.K, k2 in (k1 + 1):L.K
+		compatible(st, st.anc[k1], st.anc[k2]) || (E += 1)
+	end
+	return E
+end
+
+# Word-level version of `are_equal` and `are_equal_with_resolution` on nodes `a1`, `a2`.
+# Equal splits have equal numbers of kept leaves, and a split has no more kept leaves than a
+# split that contains it, so the counts rule out most comparisons.
+function compatible(st::EnergyState, a1, a2)
+	c1, c2 = st.count[a1], st.count[a2]
+	c1 == c2 && eq_on(st, a1, a2) && return true
+	st.resolve || return false
+	return (c1 <= c2 && subset_on(st, a1, a2) && refinable(st, a1, a2)) ||
+		(c2 <= c1 && subset_on(st, a2, a1) && refinable(st, a2, a1))
+end
+
+# Is every internal child of `a` included in or disjoint from the split of `s`?
+function refinable(st::EnergyState, s, a)
+	@inbounds for c in st.L.splitchild[a]
+		subset_on(st, c, s) || disjoint_on(st, c, s) || return false
+	end
+	return true
+end
+
+function eq_on(st::EnergyState, a, b)
+	C, m = st.L.clade, st.words
+	@inbounds for w in eachindex(m)
+		iszero((C[w, a] ⊻ C[w, b]) & m[w]) || return false
+	end
+	return true
+end
+
+function subset_on(st::EnergyState, a, b)
+	C, m = st.L.clade, st.words
+	@inbounds for w in eachindex(m)
+		iszero(C[w, a] & ~C[w, b] & m[w]) || return false
+	end
+	return true
+end
+
+function disjoint_on(st::EnergyState, a, b)
+	C, m = st.L.clade, st.words
+	@inbounds for w in eachindex(m)
+		iszero(C[w, a] & C[w, b] & m[w]) || return false
+	end
+	return true
+end
+
+"""
 """
 function compute_F(conf::Array{Bool,1}, g::Graph, γ::Real)
 	E = compute_energy(conf, g)
@@ -156,20 +405,28 @@ function compute_F(conf::Array{Bool,1}, g::Graph, γ::Real)
 end
 
 """
+	doMCMC(g::Graph, conf, M; T=1, γ=1)
+	doMCMC(st::EnergyState, M; T=1, γ=1)
+
+Run `M` Metropolis steps at temperature `T` from configuration `conf`, or from the
+configuration of `st`, which the second form updates. Return the configurations of minimal
+free energy, the final configuration, and the minimal free energy.
 """
 function doMCMC(
 	g::Graph, conf::Array{Bool,1}, M::Int64;
 	T=1, γ=1
 )
-	_conf = copy(conf)
-	E = compute_energy(_conf, g)
+	return doMCMC(EnergyState(SplitLayout(g), conf, get_resolve()), M; T, γ)
+end
+function doMCMC(st::EnergyState, M::Int64; T=1, γ=1)
+	_conf = st.conf
 	nremoved = length(_conf) - sum(_conf)
-	F = E + γ*nremoved
+	F = st.E + γ*nremoved
 	Fmin = F
 
 	oconf = [copy(_conf)]
 	for m in 1:M
-		E, F, nremoved = mcmcstep!(_conf, g, E, F, nremoved, T, γ)
+		F, nremoved = mcmcstep!(st, F, nremoved, T, γ)
 		# If new minimum is found
 		if F < Fmin
 			Fmin = F
@@ -185,24 +442,23 @@ function doMCMC(
 end
 
 """
-	mcmcstep!(conf, g, E, F, nremoved, T, γ)
+	mcmcstep!(st::EnergyState, F, nremoved, T, γ)
 
-Perform an mcmc step by flipping a leaf of `conf` at random. `E`, `F` and `nremoved` are the
-energy, the free energy and the number of removed leaves of `conf` before the step.
+Perform an mcmc step by flipping a leaf of `st` at random. `F` and `nremoved` are the free
+energy and the number of removed leaves before the step.
 
-Return `(E, F, nremoved)` after the step.
+Return `(F, nremoved)` after the step.
 """
-function mcmcstep!(conf, g, E, F, nremoved, T, γ)
-	i = rand(1:length(conf))
-	conf[i] = !conf[i]
-	nremoved_new = conf[i] ? nremoved - 1 : nremoved + 1
-	Enew = compute_energy(conf, g)
+function mcmcstep!(st::EnergyState, F, nremoved, T, γ)
+	i = rand(1:length(st.conf))
+	Enew = flip!(st, i)
+	nremoved_new = st.conf[i] ? nremoved - 1 : nremoved + 1
 	Fnew = Enew + γ*nremoved_new
 	if Fnew < F || exp(-(Fnew-F)/T) > rand()
-		return Enew, Fnew, nremoved_new
+		return Fnew, nremoved_new
 	else
-		conf[i] = !conf[i]
-		return E, F, nremoved
+		undo!(st)
+		return F, nremoved
 	end
 end
 
@@ -241,6 +497,8 @@ end
 function _sa_opt(g::Graph, γ, Trange, M)
 	reset_chance = 0.
 	conf = ones(Bool, length(g.leaves))
+	layout = SplitLayout(g)
+	st = EnergyState(layout, conf, get_resolve())
 	oconf = [copy(conf)]
 	F = Float64[Inf]
 	Fmin = F[1]
@@ -254,10 +512,9 @@ function _sa_opt(g::Graph, γ, Trange, M)
 	)
 	for T in Trange
 		if rand() < reset_chance
-			tmp_oconf, conf, fmin = doMCMC(g, oconf[rand(1:length(oconf))]; M, T, γ)
-		else
-			tmp_oconf, conf, fmin = doMCMC(g, conf, M; T,γ)
+			st = EnergyState(layout, oconf[rand(1:length(oconf))], get_resolve())
 		end
+		tmp_oconf, conf, fmin = doMCMC(st, M; T, γ)
 		append!(F,fmin)
 		# If a better conf is found than all configurations in oconf
 		# (which is the min of `f` from doMCMC), completely replace oconf

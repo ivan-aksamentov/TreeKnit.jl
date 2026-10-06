@@ -37,16 +37,39 @@ end
 	SplitGraph.set_resolve(resolve)
 	Random.seed!(2)
 	γ = 2.
-	conf = ones(Bool, n)
-	E = compute_energy(conf, g)
+	st = SplitGraph.EnergyState(SplitGraph.SplitLayout(g), ones(Bool, n), resolve)
+	@test st.E == compute_energy(st.conf, g)
 	nremoved = 0
-	F = E + γ*nremoved
+	F = st.E + γ*nremoved
 	for T in (1., 0.1)
 		for _ in 1:300
-			E, F, nremoved = SplitGraph.mcmcstep!(conf, g, E, F, nremoved, T, γ)
-			@test E == compute_energy(conf, g)
-			@test nremoved == count(!, conf)
-			@test F == E + γ*nremoved
+			F, nremoved = SplitGraph.mcmcstep!(st, F, nremoved, T, γ)
+			@test st.E == compute_energy(st.conf, g)
+			@test nremoved == count(!, st.conf)
+			@test F == st.E + γ*nremoved
+		end
+	end
+	SplitGraph.set_resolve(true)
+end
+
+@testset "Incremental energy of three trees (resolve=$resolve)" for resolve in (false, true)
+	trees = [parse_newick_string(nwk) for nwk in (
+		"(((A,B),(C,(D,E))),((F,G),(H,(I,J))),K,L);",
+		"(((A,C),(B,(D,K))),((F,(G,L)),(H,I)),J,E);",
+		"((A,(B,C,D)),(E,F,G),((H,I),(J,K,L)));",
+	)]
+	g3 = trees2graph(trees...)
+	SplitGraph.set_resolve(resolve)
+	rng = MersenneTwister(3)
+	st = SplitGraph.EnergyState(SplitGraph.SplitLayout(g3), ones(Bool, length(g3.leaves)), resolve)
+	for _ in 1:2000
+		E, count, term = st.E, copy(st.count), copy(st.term)
+		j = rand(rng, eachindex(st.conf))
+		@test SplitGraph.flip!(st, j) == compute_energy(st.conf, g3)
+		if rand(rng) < 0.5
+			SplitGraph.undo!(st)
+			@test (st.E, st.count, st.term) == (E, count, term)
+			@test st.E == compute_energy(st.conf, g3)
 		end
 	end
 	SplitGraph.set_resolve(true)
