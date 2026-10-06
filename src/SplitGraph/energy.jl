@@ -112,9 +112,10 @@ function is_trivial_split(nodeconf, conf)
 	@inbounds for i in nodeconf
 		if conf[i]
 			n += 1
+			n >= 2 && return false
 		end
 	end
-	return n < 2
+	return true
 end
 
 """
