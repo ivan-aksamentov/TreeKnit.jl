@@ -194,10 +194,11 @@ function SplitLayout(g::Graph)
 end
 
 """
-	EnergyState(L::SplitLayout, conf, resolve)
+	EnergyState(L::SplitLayout, conf, resolve; terms=true)
 
 Energy of the leaf configuration `conf`, kept equal to `compute_energy` under single-leaf
-flips (`flip!`, `undo!`).
+flips (`flip!`, `undo!`). With `terms=false`, only the numbers of kept leaves below the
+nodes are computed, for the comparisons of `conf_likelihood`.
 
 The energy is a sum of one term per kept leaf, which compares the first non-trivial ancestors
 of the leaf in each tree. Flipping leaf `j` changes the term of `j` and of the kept leaves
@@ -222,7 +223,7 @@ mutable struct EnergyState
 	anc::Vector{Int}
 end
 
-function EnergyState(L::SplitLayout, conf, resolve)
+function EnergyState(L::SplitLayout, conf, resolve; terms=true)
 	n = length(conf)
 	words = zeros(UInt64, size(L.clade, 1))
 	for i in 1:n
@@ -233,10 +234,12 @@ function EnergyState(L::SplitLayout, conf, resolve)
 		L, resolve, copy(conf), words, count, zeros(Int, n), 0, Int[], zeros(Int, n), 0, Tuple{Int,Int}[], 0,
 		zeros(Int, L.K),
 	)
-	for i in 1:n
-		st.term[i] = leaf_term(st, i)
+	if terms
+		for i in 1:n
+			st.term[i] = leaf_term(st, i)
+		end
+		st.E = sum(st.term; init = 0)
 	end
-	st.E = sum(st.term; init = 0)
 	return st
 end
 

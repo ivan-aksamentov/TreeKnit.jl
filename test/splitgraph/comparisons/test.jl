@@ -115,3 +115,62 @@ end
 	end
 	SplitGraph.set_resolve(true)
 end
+
+# Likelihood of a configuration as it was written before the split layout: climbs that
+# count kept leaves in each split, and branch lengths from `TreeTools.divtime`.
+function conf_likelihood_reference(conf, g, seq_lengths, trees)
+	L, Z = 0., 0.
+	for (i, s) in enumerate(conf)
+		for k1 in 1:g.K
+			tn1 = trees[k1].lleaves[g.labels[i]]
+			if s
+				a1, ta1 = g.leaves[i].anc[k1], tn1.anc
+				while SplitGraph.is_trivial_split(a1.conf, conf) && !a1.isroot
+					a1, ta1 = a1.anc, ta1.anc
+				end
+				for k2 in (k1+1):g.K
+					tn2 = trees[k2].lleaves[g.labels[i]]
+					a2, ta2 = g.leaves[i].anc[k2], tn2.anc
+					while SplitGraph.is_trivial_split(a2.conf, conf) && !a2.isroot
+						a2, ta2 = a2.anc, ta2.anc
+					end
+					if SplitGraph.get_resolve() ? SplitGraph.are_equal_with_resolution(g, a1, a2, conf) :
+						SplitGraph.are_equal(a1, a2, conf)
+						L += SplitGraph.branch_likelihood(
+							divtime(tn1, ta1), divtime(tn2, ta2), seq_lengths[k1], seq_lengths[k2]
+						)
+						Z += 1.
+					end
+				end
+			else
+				for k2 in 1:g.K
+					tn2 = trees[k2].lleaves[g.labels[i]]
+					L -= SplitGraph.branch_likelihood(
+						divtime(tn1, tn1.anc), divtime(tn2, tn2.anc), seq_lengths[k1], seq_lengths[k2]
+					)
+					Z += 1.
+				end
+			end
+		end
+	end
+	return L/max(Z, 1)
+end
+
+@testset "Likelihood matches the reference bit for bit (resolve=$resolve)" for resolve in (false, true)
+	SplitGraph.set_resolve(resolve)
+	rng = MersenneTwister(6)
+	layout = SplitGraph.SplitLayout(g)
+	for p in (0., 0.05, 0.3), _ in 1:5
+		conf = Vector{Bool}(rand(rng, n) .>= p)
+		expected = conf_likelihood_reference(conf, g, [1000, 1500], [t1, t2])
+		@test SplitGraph.conf_likelihood(conf, g, [1000, 1500], [t1, t2]; layout) === expected
+	end
+	SplitGraph.set_resolve(true)
+end
+
+@testset "Distance to an ancestor equals the tree distance" begin
+	for t in (t1, t2), node in values(t.lnodes), a in (node, node.anc, t.root)
+		isnothing(a) && continue
+		@test SplitGraph.distance_to_ancestor(node, a) === TreeTools.distance(node, a)
+	end
+end
