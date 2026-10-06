@@ -425,17 +425,22 @@ function doMCMC(st::EnergyState, M::Int64; T=1, γ=1)
 	Fmin = F
 
 	oconf = [copy(_conf)]
+	# `_conf` is in `oconf` and has not changed since
+	listed = true
 	for m in 1:M
-		F, nremoved = mcmcstep!(st, F, nremoved, T, γ)
+		F, nremoved, accepted = mcmcstep!(st, F, nremoved, T, γ)
+		accepted && (listed = false)
 		# If new minimum is found
 		if F < Fmin
 			Fmin = F
 			oconf[1] .= _conf
 			deleteat!(oconf, 2:length(oconf))
+			listed = true
 		end
 		# If equal minimum is found
-		if F == Fmin && !in(_conf, oconf) #mapreduce(x->x!=_conf, *, oconf)
-			push!(oconf, copy(_conf))
+		if F == Fmin && !listed
+			in(_conf, oconf) || push!(oconf, copy(_conf))
+			listed = true
 		end
 	end
 	return oconf, _conf, Fmin
@@ -447,7 +452,7 @@ end
 Perform an mcmc step by flipping a leaf of `st` at random. `F` and `nremoved` are the free
 energy and the number of removed leaves before the step.
 
-Return `(F, nremoved)` after the step.
+Return `(F, nremoved, accepted)` after the step.
 """
 function mcmcstep!(st::EnergyState, F, nremoved, T, γ)
 	i = rand(1:length(st.conf))
@@ -455,10 +460,10 @@ function mcmcstep!(st::EnergyState, F, nremoved, T, γ)
 	nremoved_new = st.conf[i] ? nremoved - 1 : nremoved + 1
 	Fnew = Enew + γ*nremoved_new
 	if Fnew < F || exp(-(Fnew-F)/T) > rand()
-		return Fnew, nremoved_new
+		return Fnew, nremoved_new, true
 	else
 		undo!(st)
-		return F, nremoved
+		return F, nremoved, false
 	end
 end
 

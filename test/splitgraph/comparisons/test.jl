@@ -43,7 +43,7 @@ end
 	F = st.E + γ*nremoved
 	for T in (1., 0.1)
 		for _ in 1:300
-			F, nremoved = SplitGraph.mcmcstep!(st, F, nremoved, T, γ)
+			F, nremoved, _ = SplitGraph.mcmcstep!(st, F, nremoved, T, γ)
 			@test st.E == compute_energy(st.conf, g)
 			@test nremoved == count(!, st.conf)
 			@test F == st.E + γ*nremoved
@@ -71,6 +71,47 @@ end
 			@test (st.E, st.count, st.term) == (E, count, term)
 			@test st.E == compute_energy(st.conf, g3)
 		end
+	end
+	SplitGraph.set_resolve(true)
+end
+
+# Annealing at one temperature as it was written before the incremental energy: the full
+# energy after every flip, and a search of the list at every step of minimal free energy.
+function doMCMC_reference(g, conf, M; T, γ)
+	_conf = copy(conf)
+	F = compute_energy(_conf, g) + γ*count(!, _conf)
+	Fmin = F
+	oconf = [copy(_conf)]
+	for _ in 1:M
+		i = rand(1:length(_conf))
+		_conf[i] = !_conf[i]
+		Fnew = compute_energy(_conf, g) + γ*count(!, _conf)
+		if Fnew < F || exp(-(Fnew-F)/T) > rand()
+			F = Fnew
+		else
+			_conf[i] = !_conf[i]
+		end
+		if F < Fmin
+			Fmin = F
+			oconf[1] .= _conf
+			deleteat!(oconf, 2:length(oconf))
+		end
+		if F == Fmin && !in(_conf, oconf)
+			push!(oconf, copy(_conf))
+		end
+	end
+	return oconf, _conf, Fmin
+end
+
+@testset "Annealing matches the full-energy reference (resolve=$resolve)" for resolve in (false, true)
+	SplitGraph.set_resolve(resolve)
+	rng = MersenneTwister(4)
+	for (T, p) in ((1., 0.), (0.2, 0.1), (0.05, 0.3))
+		conf = Vector{Bool}(rand(rng, n) .>= p)
+		Random.seed!(5)
+		expected = doMCMC_reference(g, conf, 400; T, γ = 2.)
+		Random.seed!(5)
+		@test SplitGraph.doMCMC(g, conf, 400; T, γ = 2.) == expected
 	end
 	SplitGraph.set_resolve(true)
 end
